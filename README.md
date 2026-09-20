@@ -12,7 +12,7 @@ L'environnement testé est Arduino ESP32 core 3.3.11 et ProgHard Link Arduino 0.
 
 RemoteAudio implémente ESPwayApplication et expose la page /audio ainsi que /audio/start, /audio/stop, /audio/chunk et /audio/status via le dispatcher HTTP du framework. Ces routes sont communes au LAN et au tunnel. Aucun second serveur ou tunnel n'est créé.
 
-Le microphone est éteint au démarrage. Une action explicite sur le bouton Démarrer envoie POST /audio/start. Arrêter envoie POST /audio/stop. Sans lecture pendant dix secondes, le firmware éteint le microphone. La page interroge régulièrement l'état matériel pour afficher ON ou OFF même si un autre client agit.
+Le microphone est éteint au démarrage. Une action explicite sur le bouton Démarrer envoie POST /audio/start. Arrêter envoie POST /audio/stop. Sans lecture pendant dix secondes, une tâche watchdog indépendante de la boucle HTTP et du tunnel éteint le microphone. La page interroge régulièrement l'état matériel pour afficher ON ou OFF même si un autre client agit.
 
 Le firmware acquiert le PDM à 16 kHz sur 16 bits, prend un échantillon sur deux, puis encode en G.711 μ-law mono à 8 kHz. Le débit nominal transmis est 64 kbit/s. Le navigateur décode chaque bloc et le joue avec Web Audio. Le codec a été introduit après mesure de l'insuffisance du PCM brut à 256 kbit/s.
 
@@ -43,7 +43,7 @@ Le script tools/probe_audio.py mesure les blocs depuis le LAN et peut recevoir u
 | Acquisition | Blocs réels de microphone reçus ; échantillons variables, mais réaction à un son contrôlé non vérifiée |
 | PCM brut 16 kHz | 132 à 163 kbit/s utiles au LAN contre 256 kbit/s nécessaires ; pertes de buffer |
 | G.711 μ-law 8 kHz | Blocs LAN reçus, mais plusieurs requêtes ont pris 2 à 9 secondes ; pertes de buffer, lecture continue non validée |
-| Sécurité arrêt | Après interruption du test, /audio/status a confirmé microphone OFF |
+| Sécurité arrêt | Test USB avec LAN inaccessible : ON puis OFF en environ dix secondes, confirmé par USB. Image normale : POST ON, puis statut OFF après quatorze secondes sans lecture. |
 | Navigateur LAN | Page compilée et servie, écoute auditive non validée |
 | Tunnel distant | Connexion du tunnel vérifiée ; page et flux distants non validés avec une session utilisateur |
 | Stabilité plusieurs minutes | Non validée |
