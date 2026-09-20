@@ -1,46 +1,57 @@
 # ProgHard Link Remote Audio
 
-Laboratoire autonome d'écoute du microphone de la Seeed Studio XIAO ESP32-S3 Sense. La caméra n'est pas utilisée. ProgHard Link est une dépendance externe, jamais modifiée par ce dépôt.
+Laboratoire autonome pour le microphone de la Seeed Studio XIAO ESP32-S3 Sense. La caméra n'est pas utilisée. ProgHard Link reste une dépendance externe.
 
-## Matériel et logiciel
+## Matériel vérifié
 
-- XIAO ESP32-S3 Sense avec microphone PDM sur GPIO 42 (horloge) et GPIO 41 (données).
-- ESP32-S3 révision 0.2, flash 8 Mo et PSRAM intégrée 8 Mo, vérifiés sur COM12 avec `esptool flash-id` / `chip-id`.
-- Arduino ESP32 core 3.3.11 et bibliothèque ProgHard Link 0.4.13 (dépôt local `../ProgHard-Link/firmware/esp8266/libraries/ESPway`).
+L'utilisateur a confirmé la XIAO ESP32-S3 Sense. Sur COM12, esptool a identifié un ESP32-S3 révision 0.2, 8 Mo de flash et 8 Mo de PSRAM. Le microphone est PDM : GPIO 42 pour l'horloge et GPIO 41 pour les données, selon la [documentation officielle Seeed](https://wiki.seeedstudio.com/xiao_esp32s3_sense_mic/).
 
-Voir la [documentation officielle du microphone Seeed](https://wiki.seeedstudio.com/xiao_esp32s3_sense_mic/).
+L'environnement testé est Arduino ESP32 core 3.3.11 et ProgHard Link Arduino 0.4.13 dans le dépôt voisin ProgHard-Link. La bibliothèque n'est pas copiée dans ce projet.
 
 ## Architecture
 
-L'application implémente `ESPwayApplication`. Sa page et ses routes utilisent le dispatcher HTTP du framework, commun au LAN et au tunnel. Aucun serveur ni tunnel secondaire n'est créé. Le microphone est arrêté au démarrage, puis activé par `POST /audio/start` et désactivé par `POST /audio/stop` ou après trois secondes sans lecture. `GET /audio/chunk` renvoie environ 100 ms de PCM signé mono 16 bits à 16 kHz (**256 kbit/s**, soit 32 ko/s). Le navigateur lit des blocs successifs avec Web Audio. `GET /audio/status` expose ON/OFF, blocs lus, lectures courtes et mémoire libre.
+RemoteAudio implémente ESPwayApplication et expose la page /audio ainsi que /audio/start, /audio/stop, /audio/chunk et /audio/status via le dispatcher HTTP du framework. Ces routes sont communes au LAN et au tunnel. Aucun second serveur ou tunnel n'est créé.
 
-Cette méthode HTTP est simple et compatible avec le tunnel existant, mais son débit et sa latence réels doivent être mesurés. Elle ne promet pas une diffusion multi-utilisateur : une seule session d'écoute est prévue.
+Le microphone est éteint au démarrage. Une action explicite sur le bouton Démarrer envoie POST /audio/start. Arrêter envoie POST /audio/stop. Sans lecture pendant dix secondes, le firmware éteint le microphone. La page interroge régulièrement l'état matériel pour afficher ON ou OFF même si un autre client agit.
+
+Le firmware acquiert le PDM à 16 kHz sur 16 bits, prend un échantillon sur deux, puis encode en G.711 μ-law mono à 8 kHz. Le débit nominal transmis est 64 kbit/s. Le navigateur décode chaque bloc et le joue avec Web Audio. Le codec a été introduit après mesure de l'insuffisance du PCM brut à 256 kbit/s.
 
 ## Compilation et flash
 
-Depuis ce dossier, avec Arduino CLI et le core ESP32 installés :
+Depuis ce dossier, avec Arduino CLI installé :
 
-```powershell
-arduino-cli compile --fqbn esp32:esp32:XIAO_ESP32S3:PSRAM=opi,USBMode=hwcdc --libraries '..\ProgHard-Link\firmware\esp8266\libraries' --output-dir build RemoteAudio
-arduino-cli upload -p COM12 --fqbn esp32:esp32:XIAO_ESP32S3:PSRAM=opi,USBMode=hwcdc --input-dir build RemoteAudio
-```
+    arduino-cli compile --fqbn esp32:esp32:XIAO_ESP32S3:PSRAM=opi,USBMode=hwcdc --libraries '..\ProgHard-Link\firmware\esp8266\libraries' --output-dir build RemoteAudio
+    arduino-cli upload -p COM12 --fqbn esp32:esp32:XIAO_ESP32S3:PSRAM=opi,USBMode=hwcdc --input-dir build RemoteAudio
 
-Adapter le chemin de la bibliothèque et le port si nécessaire. Un flash USB standard conserve normalement la configuration du framework si la table de partitions est compatible. Éviter l'effacement complet si l'identité du périphérique est déjà liée au serveur.
+Adapter le port et le chemin de bibliothèque au PC. Le flash USB a conservé la configuration Wi-Fi et l'identité ProgHard Link présentes sur cette carte ; un effacement complet pourrait les supprimer.
 
 ## Utilisation
 
-Configurer le Wi-Fi et ProgHard Link via les pages du framework. Ouvrir `/audio` sur l'IP LAN. Cliquer sur **Démarrer l'écoute**, puis **Arrêter**. La page affiche l'état et le débit reçu. Pour l'accès distant, ouvrir le même chemin `/audio` sur l'URL du périphérique depuis le Device Manager ProgHard Link.
+Après configuration du Wi-Fi et de ProgHard Link, ouvrir l'adresse LAN de la carte suivie de /audio. Sur l'appareil testé, l'adresse était http://192.168.50.198/audio. Pour un accès distant, ouvrir la même page /audio depuis le Device Manager ProgHard Link.
 
-## Vérification
+**État expérimental : l'écoute continue n'est pas encore validée.** Les mesures ci-dessous montrent des pauses HTTP de plusieurs secondes. Le bouton et les routes permettent de diagnostiquer l'acquisition, mais cette version ne doit pas être présentée comme une solution d'écoute fiable.
 
-| Étape | État |
-|---|---|
-| Identification puce, flash et PSRAM | Confirmée avec `esptool` |
-| Compilation Arduino | En cours |
-| Acquisition et variation des échantillons | À tester sur carte |
-| Écoute LAN et stabilité | À tester |
-| Écoute via ProgHard Link | À tester |
+Le script tools/probe_audio.py mesure les blocs depuis le LAN et peut recevoir une URL de base en argument. Il active le microphone puis l'éteint en fin de test.
 
-## Limites connues
+## Résultats mesurés le 20 septembre 2026
 
-Le contrat public `WebResponse` assemble chaque corps en mémoire avant envoi et le tunnel l'encode en base64. Cela convient à de petits blocs PCM mais ajoute allocations et surcoût. Il n'expose actuellement pas de streaming HTTP continu ni de WebSocket applicatif à travers la même route. L'accès LAN aux routes applicatives n'a pas d'authentification utilisateur fournie par le framework ; restreindre le LAN aux personnes de confiance.
+| Étape | Résultat |
+| --- | --- |
+| Matériel | Modèle confirmé par l'utilisateur ; puce, flash et PSRAM vérifiés par esptool |
+| Démarrage | Wi-Fi LAN connecté ; tunnel espway-tunnel/2 connecté et métadonnées vérifiées dans le journal série |
+| Compilation | Réussie avec Arduino CLI et la bibliothèque externe |
+| Acquisition | Blocs réels de microphone reçus ; échantillons variables, mais réaction à un son contrôlé non vérifiée |
+| PCM brut 16 kHz | 132 à 163 kbit/s utiles au LAN contre 256 kbit/s nécessaires ; pertes de buffer |
+| G.711 μ-law 8 kHz | Blocs LAN reçus, mais plusieurs requêtes ont pris 2 à 9 secondes ; pertes de buffer, lecture continue non validée |
+| Sécurité arrêt | Après interruption du test, /audio/status a confirmé microphone OFF |
+| Navigateur LAN | Page compilée et servie, écoute auditive non validée |
+| Tunnel distant | Connexion du tunnel vérifiée ; page et flux distants non validés avec une session utilisateur |
+| Stabilité plusieurs minutes | Non validée |
+
+## Limites observées
+
+Le contrat public WebResponse assemble chaque réponse en mémoire. Le tunnel encode ensuite le corps en base64 et ferme le flux de requête ; il ne fournit pas de flux HTTP continu ou de WebSocket applicatif. Pour obtenir de l'audio, cette application doit donc multiplier les réponses HTTP courtes. Sur l'appareil et le réseau testés, leur latence est trop irrégulière pour maintenir une lecture continue, même à 64 kbit/s. C'est une limite générique potentielle pour les applications à flux continu ; elle est documentée ici, sans modification de ProgHard Link.
+
+Les routes applicatives LAN ne disposent pas d'une authentification utilisateur fournie par le framework. Un client du LAN peut activer le microphone par POST. La page affiche l'état réel et le délai d'inactivité éteint le micro, mais l'accès LAN doit rester réservé aux personnes de confiance.
+
+L'essai n'a pas encore établi la latence ou la stabilité du tunnel distant, ni une variation contrôlée du niveau sonore. Aucune mesure de plusieurs minutes n'est revendiquée.

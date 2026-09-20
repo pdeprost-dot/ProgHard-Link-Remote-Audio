@@ -6,3 +6,4 @@ build/
 *.uf2
 secrets.*
 .env
+__pycache__/
