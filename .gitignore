@@ -1,0 +1,8 @@
+build/
+*.log
+*.bin
+*.elf
+*.map
+*.uf2
+secrets.*
+.env
