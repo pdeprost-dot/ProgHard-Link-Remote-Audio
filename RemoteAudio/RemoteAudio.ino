@@ -1,5 +1,7 @@
 #include <ESPway.h>
 #include <ESP_I2S.h>
+#include <WiFi.h>
+#include <math.h>
 
 namespace {
 constexpr uint32_t SAMPLE_RATE = 16000;
@@ -18,6 +20,12 @@ uint32_t droppedBytes = 0;
 volatile uint32_t lastRead = 0;
 uint32_t blocks = 0;
 uint32_t shortReads = 0;
+uint32_t servedBytes = 0;
+uint32_t pcmCount = 0;
+int64_t pcmSum = 0;
+uint64_t pcmSumSquares = 0;
+int16_t pcmMin = 32767, pcmMax = -32768;
+uint32_t pcmWindowStarted = 0;
 
 uint8_t encodeMuLaw(int16_t value) {
   int sample = value;
@@ -132,20 +140,37 @@ void captureLoop(void*) {
     portEXIT_CRITICAL(&audioMux);
     if (!active) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
     const size_t got = microphone.readBytes(data, sizeof(data));
+    uint8_t encoded[128];
+    size_t encodedCount = 0;
+    int64_t sampleSum = 0;
+    uint64_t sampleSquares = 0;
+    int16_t sampleMin = 32767, sampleMax = -32768;
+    for (size_t i = 0; i + 1 < got; i += 2) {
+      const int16_t pcm = static_cast<int16_t>(
+        static_cast<uint16_t>(static_cast<uint8_t>(data[i])) |
+        (static_cast<uint16_t>(static_cast<uint8_t>(data[i + 1])) << 8)
+      );
+      sampleSum += pcm;
+      sampleSquares += static_cast<int32_t>(pcm) * static_cast<int32_t>(pcm);
+      if (pcm < sampleMin) sampleMin = pcm;
+      if (pcm > sampleMax) sampleMax = pcm;
+      if ((i & 2) == 0) encoded[encodedCount++] = encodeMuLaw(pcm);
+    }
     portENTER_CRITICAL(&audioMux);
     if (got != sizeof(data)) ++shortReads;
     if (micOn) {
-      for (size_t i = 0; i + 1 < got; i += 4) {
+      pcmCount += got / 2;
+      pcmSum += sampleSum;
+      pcmSumSquares += sampleSquares;
+      if (sampleMin < pcmMin) pcmMin = sampleMin;
+      if (sampleMax > pcmMax) pcmMax = sampleMax;
+      for (size_t i = 0; i < encodedCount; ++i) {
         if (ringUsed == sizeof(ring)) {
           ringRead = (ringRead + 1) % sizeof(ring);
           --ringUsed;
           ++droppedBytes;
         }
-        const int16_t pcm = static_cast<int16_t>(
-          static_cast<uint16_t>(static_cast<uint8_t>(data[i])) |
-          (static_cast<uint16_t>(static_cast<uint8_t>(data[i + 1])) << 8)
-        );
-        ring[ringWrite] = static_cast<char>(encodeMuLaw(pcm));
+        ring[ringWrite] = static_cast<char>(encoded[i]);
         ringWrite = (ringWrite + 1) % sizeof(ring);
         ++ringUsed;
       }
@@ -163,6 +188,8 @@ bool startMic() {
     const bool ready = microphone.begin(I2S_MODE_PDM_RX, SAMPLE_RATE, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO);
     portENTER_CRITICAL(&audioMux);
     ringRead = ringWrite = ringUsed = 0;
+    pcmCount = 0; pcmSum = 0; pcmSumSquares = 0;
+    pcmMin = 32767; pcmMax = -32768; pcmWindowStarted = millis();
     micOn = ready;
     portEXIT_CRITICAL(&audioMux);
   }
@@ -198,7 +225,7 @@ void watchdogLoop(void*) {
 class RemoteAudioApp : public ESPwayApplication {
  public:
   const char* applicationId() const override { return "remote-audio"; }
-  const char* firmwareVersion() const override { return "0.1.1"; }
+  const char* firmwareVersion() const override { return "0.1.2"; }
   void begin(const ESPwayApplicationContext&) override {
     controlLock = xSemaphoreCreateMutex();
     xTaskCreatePinnedToCore(captureLoop, "audio-capture", 4096, nullptr, 0, &captureTask, 1);
@@ -221,8 +248,41 @@ class RemoteAudioApp : public ESPwayApplication {
       return true;
     }
     if (!req.path.startsWith("/audio/")) return false;
+    if (req.path == "/audio/bench" && req.method == "GET") {
+      static char payload[2048];
+      static bool initialized = false;
+      if (!initialized) {
+        for (size_t i = 0; i < sizeof(payload); ++i) payload[i] = static_cast<char>('A' + (i % 26));
+        initialized = true;
+      }
+      res.contentType = "application/octet-stream";
+      res.body = String(payload, sizeof(payload));
+      return true;
+    }
+    if (req.path == "/audio/level" && req.method == "GET") {
+      uint32_t count, elapsed;
+      int64_t sum;
+      uint64_t squares;
+      int16_t minimum, maximum;
+      portENTER_CRITICAL(&audioMux);
+      count = pcmCount; sum = pcmSum; squares = pcmSumSquares;
+      minimum = pcmMin; maximum = pcmMax;
+      elapsed = millis() - pcmWindowStarted;
+      pcmCount = 0; pcmSum = 0; pcmSumSquares = 0;
+      pcmMin = 32767; pcmMax = -32768; pcmWindowStarted = millis();
+      portEXIT_CRITICAL(&audioMux);
+      const double mean = count ? static_cast<double>(sum) / count : 0;
+      const double rms = count ? sqrt(static_cast<double>(squares) / count) : 0;
+      const double acRms = sqrt(fmax(0.0, rms * rms - mean * mean));
+      const int32_t peak = count ? max(abs(static_cast<int32_t>(minimum)), abs(static_cast<int32_t>(maximum))) : 0;
+      res.body = String("{\"samples\":") + count + ",\"duration_ms\":" + elapsed +
+        ",\"mean\":" + String(mean, 1) + ",\"rms\":" + String(rms, 1) +
+        ",\"ac_rms\":" + String(acRms, 1) + ",\"min\":" + (count ? minimum : 0) +
+        ",\"max\":" + (count ? maximum : 0) + ",\"peak\":" + peak + "}";
+      return true;
+    }
     if (req.path == "/audio/status" && req.method == "GET") {
-      res.body = String("{\"microphone\":\"") + (micOn ? "ON" : "OFF") + "\",\"blocks\":" + blocks + ",\"short_reads\":" + shortReads + ",\"dropped_bytes\":" + droppedBytes + ",\"queued_bytes\":" + ringUsed + ",\"free_heap\":" + ESP.getFreeHeap() + ",\"free_psram\":" + ESP.getFreePsram() + "}";
+      res.body = String("{\"microphone\":\"") + (micOn ? "ON" : "OFF") + "\",\"blocks\":" + blocks + ",\"short_reads\":" + shortReads + ",\"dropped_bytes\":" + droppedBytes + ",\"queued_bytes\":" + ringUsed + ",\"free_heap\":" + ESP.getFreeHeap() + ",\"free_psram\":" + ESP.getFreePsram() + ",\"served_bytes\":" + servedBytes + ",\"wifi_rssi\":" + WiFi.RSSI() + "}";
     } else if (req.path == "/audio/start" && req.method == "POST") {
       if (!startMic()) { res.status = 503; res.body = "{\"error\":\"microphone_init\"}"; }
       else res.body = "{\"microphone\":\"ON\"}";
@@ -239,7 +299,7 @@ class RemoteAudioApp : public ESPwayApplication {
         ringRead = (ringRead + 1) % sizeof(ring);
       }
       ringUsed -= got;
-      if (got) ++blocks;
+      if (got) { ++blocks; servedBytes += got; }
       portEXIT_CRITICAL(&audioMux);
       res.contentType = "application/octet-stream";
       res.body = String(block, static_cast<unsigned int>(got));
