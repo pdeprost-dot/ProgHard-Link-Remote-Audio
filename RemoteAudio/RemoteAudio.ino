@@ -7,6 +7,7 @@ namespace {
 constexpr uint32_t SAMPLE_RATE = 16000;
 constexpr size_t BLOCK_BYTES = 2048;  // up to 256 ms, mono G.711 mu-law at 8 kHz
 constexpr uint32_t IDLE_TIMEOUT_MS = 10000;
+constexpr int32_t AUDIO_GAIN = 8;
 I2SClass microphone;
 volatile bool micOn = false;
 char ring[32768];
@@ -21,6 +22,8 @@ volatile uint32_t lastRead = 0;
 uint32_t blocks = 0;
 uint32_t shortReads = 0;
 uint32_t servedBytes = 0;
+uint32_t clippedSamples = 0;
+int32_t dcAccumulator = 0;
 uint32_t pcmCount = 0;
 int64_t pcmSum = 0;
 uint64_t pcmSumSquares = 0;
@@ -54,7 +57,8 @@ dt{color:#9ca3af}dd{margin:0 0 1rem}a{color:#93c5fd}
 <dt>Microphone</dt><dd id="mic">OFF</dd>
 <dt>Format</dt><dd>G.711 &mu;-law mono, 8 bits, 8 kHz</dd>
 <dt>D&eacute;bit audio</dt><dd id="rate">0 kbit/s</dd>
-<dt>Buffer</dt><dd id="buffer">0 ms</dd></dl>
+<dt>Buffer</dt><dd id="buffer">0 ms</dd>
+<dt>Wi-Fi RSSI</dt><dd id="rssi">-- dBm</dd></dl>
 <button id="start">D&eacute;marrer l'&eacute;coute</button><button id="stop" disabled>Arr&ecirc;ter</button>
 <p>Le microphone ne d&eacute;marre qu'apr&egrave;s une action explicite. Il s'arr&ecirc;te apr&egrave;s 10 secondes sans lecture.</p>
 <p><a href="/">Accueil ProgHard Link</a></p></main><script>
@@ -82,6 +86,7 @@ async function refresh(){
   try{
     const state=await(await api('/audio/status','GET',3000)).json();
     micActive=state.microphone==='ON';
+    el('rssi').textContent=state.wifi_rssi+' dBm';
     el('conn').textContent='Connecte';
     update();
   }catch(e){el('conn').textContent='Erreur : '+e.message}
@@ -145,6 +150,7 @@ void captureLoop(void*) {
     int64_t sampleSum = 0;
     uint64_t sampleSquares = 0;
     int16_t sampleMin = 32767, sampleMax = -32768;
+    uint32_t localClipped = 0;
     for (size_t i = 0; i + 1 < got; i += 2) {
       const int16_t pcm = static_cast<int16_t>(
         static_cast<uint16_t>(static_cast<uint8_t>(data[i])) |
@@ -154,12 +160,20 @@ void captureLoop(void*) {
       sampleSquares += static_cast<int32_t>(pcm) * static_cast<int32_t>(pcm);
       if (pcm < sampleMin) sampleMin = pcm;
       if (pcm > sampleMax) sampleMax = pcm;
-      if ((i & 2) == 0) encoded[encodedCount++] = encodeMuLaw(pcm);
+      // Track the DC offset before applying a fixed gain to the AC signal.
+      dcAccumulator += pcm - (dcAccumulator >> 10);
+      if ((i & 2) == 0) {
+        int32_t amplified = (static_cast<int32_t>(pcm) - (dcAccumulator >> 10)) * AUDIO_GAIN;
+        if (amplified > 32767) { amplified = 32767; ++localClipped; }
+        if (amplified < -32768) { amplified = -32768; ++localClipped; }
+        encoded[encodedCount++] = encodeMuLaw(static_cast<int16_t>(amplified));
+      }
     }
     portENTER_CRITICAL(&audioMux);
     if (got != sizeof(data)) ++shortReads;
     if (micOn) {
       pcmCount += got / 2;
+      clippedSamples += localClipped;
       pcmSum += sampleSum;
       pcmSumSquares += sampleSquares;
       if (sampleMin < pcmMin) pcmMin = sampleMin;
@@ -190,6 +204,7 @@ bool startMic() {
     ringRead = ringWrite = ringUsed = 0;
     pcmCount = 0; pcmSum = 0; pcmSumSquares = 0;
     pcmMin = 32767; pcmMax = -32768; pcmWindowStarted = millis();
+    clippedSamples = 0; dcAccumulator = 0;
     micOn = ready;
     portEXIT_CRITICAL(&audioMux);
   }
@@ -225,7 +240,7 @@ void watchdogLoop(void*) {
 class RemoteAudioApp : public ESPwayApplication {
  public:
   const char* applicationId() const override { return "remote-audio"; }
-  const char* firmwareVersion() const override { return "0.1.2"; }
+  const char* firmwareVersion() const override { return "1.0.0"; }
   void begin(const ESPwayApplicationContext&) override {
     controlLock = xSemaphoreCreateMutex();
     xTaskCreatePinnedToCore(captureLoop, "audio-capture", 4096, nullptr, 0, &captureTask, 1);
@@ -282,7 +297,7 @@ class RemoteAudioApp : public ESPwayApplication {
       return true;
     }
     if (req.path == "/audio/status" && req.method == "GET") {
-      res.body = String("{\"microphone\":\"") + (micOn ? "ON" : "OFF") + "\",\"blocks\":" + blocks + ",\"short_reads\":" + shortReads + ",\"dropped_bytes\":" + droppedBytes + ",\"queued_bytes\":" + ringUsed + ",\"free_heap\":" + ESP.getFreeHeap() + ",\"free_psram\":" + ESP.getFreePsram() + ",\"served_bytes\":" + servedBytes + ",\"wifi_rssi\":" + WiFi.RSSI() + "}";
+      res.body = String("{\"microphone\":\"") + (micOn ? "ON" : "OFF") + "\",\"blocks\":" + blocks + ",\"short_reads\":" + shortReads + ",\"dropped_bytes\":" + droppedBytes + ",\"queued_bytes\":" + ringUsed + ",\"free_heap\":" + ESP.getFreeHeap() + ",\"free_psram\":" + ESP.getFreePsram() + ",\"served_bytes\":" + servedBytes + ",\"wifi_rssi\":" + WiFi.RSSI() + ",\"gain\":" + AUDIO_GAIN + ",\"clipped_samples\":" + clippedSamples + "}";
     } else if (req.path == "/audio/start" && req.method == "POST") {
       if (!startMic()) { res.status = 503; res.body = "{\"error\":\"microphone_init\"}"; }
       else res.body = "{\"microphone\":\"ON\"}";
